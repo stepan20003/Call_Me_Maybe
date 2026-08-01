@@ -1,17 +1,21 @@
 install:
-	pip install pydantic numpy flake8 mypy
+	uv sync
 
 run:
-	python3 -m src
+	uv run python -m src
 
 debug:
-	python3 -m pdb src/__main__.py
+	uv run python -m pdb src/__main__.py
 
 clean:
-	rm -rf __pycache__ src/__pycache__ .mypy_cache
+	rm -rf __pycache__ src/__pycache__ .mypy_cache .pytest_cache
 
 lint:
-	flake8 src/
-	mypy --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs src/
+	flake8 .
+	mypy . --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs
 
-.PHONY: install run debug clean lint
+lint-strict:
+	flake8 .
+	mypy . --strict
+
+.PHONY: install run debug clean lint lint-strict

@@ -1,15 +1,20 @@
+"""Custom Byte-Level BPE Tokenizer implementation for LLM models."""
+
 import json
-from typing import List, Dict, Tuple
+import re
+from typing import Dict, List, Optional, Set, Tuple
+
 
 def bytes_to_unicode() -> Dict[int, str]:
-    """Ստեղծում է քարտեզագրում բայթերի (0..255) և Unicode սիմվոլների միջև:
-    
-    Սա թույլ է տալիս բացատները և հատուկ նշանները ճիշտ կոդավորել, ինչպես Qwen/GPT մոդելներում:
+    """Map ASCII and Unicode bytes to visual representation strings.
+
+    Returns:
+        Dict[int, str]: A mapping from byte integers to unicode characters.
     """
     bs = (
-        list(range(ord("!"), ord("~") + 1)) + 
-        list(range(ord("¡"), ord("¬") + 1)) + 
-        list(range(ord("®"), ord("¶") + 1))
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
     )
     cs = bs[:]
     n = 0
@@ -18,76 +23,103 @@ def bytes_to_unicode() -> Dict[int, str]:
             bs.append(b)
             cs.append(256 + n)
             n += 1
-    cs_str = [chr(n) for n in cs]
+    cs_str = [chr(x) for x in cs]
     return dict(zip(bs, cs_str))
 
 
 class CustomTokenizer:
-    """Զրոյից իրականացված իսկական Byte-Level BPE Tokenizer:"""
+    """Custom BPE Tokenizer for encoding and decoding text without external LLM libs."""
 
-    def __init__(self, vocab_path: str, merges_path: str):
-        with open(vocab_path, 'r', encoding='utf-8') as f:
-            self.vocab: Dict[str, int] = json.load(f)
+    def __init__(self, vocab_file_path: str, merges_file_path: Optional[str] = None) -> None:
+        """Initialize the tokenizer from a vocab or tokenizer.json file.
+
+        Args:
+            vocab_file_path: Path to the vocabulary JSON file provided by the SDK.
+        """
+        self.byte_encoder: Dict[int, str] = bytes_to_unicode()
+        self.byte_decoder: Dict[str, int] = {
+            v: k for k, v in self.byte_encoder.items()
+        }
         
-        self.index_to_token: Dict[int, str] = {v: k for k, v in self.vocab.items()}
-        
-        # Բայթերի փոխարկիչ
-        self.byte_encoder = bytes_to_unicode()
-        self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
-        
-        # Բեռնում ենք merges.txt-ը և ստեղծում ենք զույգերի հերթականությունը (առաջնահերթությունը)
+        self.vocab: Dict[str, int] = {}
         self.bpe_ranks: Dict[Tuple[str, str], int] = {}
-        with open(merges_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            # Եթե առաջին տողը մեկնաբանություն է (#version), բաց թողնել
-            start_idx = 1 if lines[0].startswith("#") else 0
-            for idx, line in enumerate(lines[start_idx:]):
-                line = line.strip()
-                if not line:
-                    continue
-                parts = tuple(line.split())
-                if len(parts) == 2:
-                    self.bpe_ranks[parts] = idx
 
-    def _get_pairs(self, word: List[str]) -> set[Tuple[str, str]]:
-        """Վերադարձնում է բառի մեջ կողք կողքի գտնվող բոլոր սիմվոլների զույգերը:"""
-        pairs = set()
+        with open(vocab_file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Ստուգում ենք՝ արդյոք data-ն HuggingFace tokenizer.json է
+        if isinstance(data, dict) and "model" in data and isinstance(data["model"], dict):
+            if "vocab" in data["model"] and isinstance(data["model"]["vocab"], dict):
+                self.vocab = data["model"]["vocab"]
+                merges = data["model"].get("merges", [])
+                for idx, merge_str in enumerate(merges):
+                    if isinstance(merge_str, str):
+                        parts = tuple(merge_str.split())
+                        if len(parts) == 2:
+                            self.bpe_ranks[(parts[0], parts[1])] = idx
+        # Եթե data-ն ուղղակի {"token_str": id} կամ {id: "token_str"} բառարան է
+        elif isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, int):
+                    self.vocab[k] = v
+                elif isinstance(v, str):
+                    self.vocab[v] = int(k)
+
+        self.index_to_token: Dict[int, str] = {
+            v: k for k, v in self.vocab.items()
+        }
+
+        # Regex pre-tokenization pattern
+        # Standard Python re compatible pattern for Unicode pre-tokenization
+        self.pat = re.compile(
+            r"""'s|'t|'re|'ve|'m|'ll|'d| ?[^\s\w\d]+|\s+(?!\S)|\s+| ?\w+| ?\d+""",
+            re.UNICODE,
+        )
+
+    def _get_pairs(self, word: List[str]) -> Set[Tuple[str, str]]:
+        """Extract adjacent pairs of symbols from a word.
+
+        Args:
+            word: List of string symbols.
+
+        Returns:
+            Set[Tuple[str, str]]: Set of symbol pairs.
+        """
+        pairs: Set[Tuple[str, str]] = set()
         for i in range(len(word) - 1):
-            pairs.add((word[i], word[i+1]))
+            pairs.add((word[i], word[i + 1]))
         return pairs
 
-    def encode(self, text: str) -> List[int]:
-        """Տեքստը վերածում է ID-ների՝ ըստ Byte-Level BPE կանոնների:"""
-        if not text:
-            return []
+    def _bpe(self, token: str) -> List[str]:
+        """Apply BPE merge operations to a single token string.
 
-        # 1. Տեքստի ամեն մի սիմվոլ վերածում ենք իր հատուկ BPE Unicode տեսքին
-        tokenized_bytes = []
-        for b in text.encode("utf-8"):
-            tokenized_bytes.append(self.byte_encoder[b])
-        
-        # Սա մեր սկզբնական թոքենների ցուցակն է (տառ առ տառ/բայթ առ բայթ)
-        word = tokenized_bytes
+        Args:
+            token: Raw string token.
+
+        Returns:
+            List[str]: List of merged subword tokens.
+        """
+        token_bytes = [self.byte_encoder[b] for b in token.encode("utf-8")]
+        word = token_bytes
         pairs = self._get_pairs(word)
 
         if not pairs:
-            return [self.vocab.get(tokenized_bytes[0])]
+            return word
 
-        # 2. Միավորման (Merge) հիմնական ցիկլը
         while True:
-            # Գտնում ենք այն զույգը, որն ունի ամենաբարձր առաջնահերթությունը (ամենափոքր rank-ը)
-            bigram = min(pairs, key=lambda pair: self.bpe_ranks.get(pair, float('inf')))
-            
-            # Եթե ընտրված զույգը չկա merges-ի մեջ, ավարտում ենք
+            # Գտնում ենք ամենափոքր rank (ամենաբարձր առաջնահերթություն) ունեցող զույգը
+            bigram = min(
+                pairs,
+                key=lambda pair: self.bpe_ranks.get(pair, float("inf")),
+            )
             if bigram not in self.bpe_ranks:
                 break
-                
-            # Միավորում ենք ընտրված զույգը ամբողջ ցուցակում
-            new_word = []
+
+            new_word: List[str] = []
             i = 0
             while i < len(word):
-                if i < len(word) - 1 and (word[i], word[i+1]) == bigram:
-                    new_word.append(word[i] + word[i+1])
+                if i < len(word) - 1 and (word[i], word[i + 1]) == bigram:
+                    new_word.append(word[i] + word[i + 1])
                     i += 2
                 else:
                     new_word.append(word[i])
@@ -97,12 +129,34 @@ class CustomTokenizer:
             if not pairs:
                 break
 
-        # 3. Թոքենները վերածում ենք ID-ների
-        return [self.vocab[t] for t in word if t in self.vocab]
+        return word
+
+    def encode(self, text: str) -> List[int]:
+        """Encode string text into a list of token IDs."""
+        if not text:
+            return []
+
+        bpe_tokens: List[int] = []
+        matches = self.pat.findall(text)
+        for match in matches:
+            for bpe_token in self._bpe(match):
+                if bpe_token in self.vocab:
+                    bpe_tokens.append(self.vocab[bpe_token])
+
+        return bpe_tokens
 
     def decode(self, token_ids: List[int]) -> str:
-        """ID-ները հետ է վերածում բնական տեքստի՝ հաշվի առնելով բայթերը:"""
+        """Decode a list of token IDs back into a UTF-8 string.
+
+        Args:
+            token_ids: List of integer token IDs.
+
+        Returns:
+            str: Decoded UTF-8 string.
+        """
         text = "".join([self.index_to_token.get(tid, "") for tid in token_ids])
-        # Փոխարկում ենք Unicode նշանները հետ՝ հում բայթերի
-        byte_tokens = bytes([self.byte_decoder[c] for c in text])
-        return byte_tokens.decode("utf-8", errors="replace")
+        byte_list = [
+            self.byte_decoder[c] if c in self.byte_decoder else ord(c)
+            for c in text
+        ]
+        return bytes(byte_list).decode("utf-8", errors="replace")

@@ -1,54 +1,33 @@
-from llm_sdk import Small_LLM_Model
+import numpy as np
+from llm_sdk.llm_sdk import Small_LLM_Model
 from src.tokenizer import CustomTokenizer
 
-def test_my_tokenizer() -> None:
-    # 1. Սահմանում ենք ֆայլերի ճշգրիտ ճանապարհները
-    vocab_path = "/home/stepan/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/vocab.json"
-    merges_path = "/home/stepan/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/merges.txt"
+# 1. Ինիցիալիզացնում ենք մոդելն ու tokenizer-ը
+model = Small_LLM_Model()
+vocab_path = model.get_path_to_vocab_file()
+tokenizer = CustomTokenizer(vocab_path)
 
-    print("⏳ Բեռնվում են օրիգինալ SDK մոդելը և քո Թոքենայզերը...")
-    model = Small_LLM_Model()
-    my_tokenizer = CustomTokenizer(vocab_path=vocab_path, merges_path=merges_path)
+# 2. Prompt-ը վերածում ենք ID-ների
+prompt = "What is the sum of 2 and 3?"
 
-    # 2. Թեստային տեքստեր (փորձիր պարզից մինչև բարդ նախադասություններ)
-    test_prompts = [
-        "Hello",
-        "Hello World!",
-        "Call me maybe",
-        "The quick brown fox jumps over the lazy dog."
-    ]
+input_ids = tokenizer.encode(prompt)
 
-    print("\n🚀 Սկսվում է համեմատությունը...\n")
-    
-    all_passed = True
-    for idx, text in enumerate(test_prompts, 1):
-        print(f"--- Թեստ #{idx}: '{text}' ---")
-        
-        # Օրիգինալ SDK-ի արդյունքը
-        sdk_ids = model.encode(text)
-        if hasattr(sdk_ids, "tolist"):
-            sdk_ids = sdk_ids.tolist()[0]
-        # Քո գրած թոքենայզերի արդյունքը
-        my_ids = my_tokenizer.encode(text)
-        
-        print(f"Original SDK IDs : {sdk_ids}")
-        print(f"Your BPE IDs    : {my_ids}")
-        
-        if sdk_ids == my_ids:
-            print("✅ ՄԱՔՈՒՐ Է (MATCH)")
-        else:
-            print("❌ ՍԽԱԼ ԿԱ (MISMATCH)")
-            all_passed = False
-            
-            # Ստուգենք նաև դեկոդավորումը
-            print(f"Original decoded: '{model.decode(sdk_ids)}'")
-            print(f"Your decoded    : '{my_tokenizer.decode(my_ids)}'")
-        print()
+# 3. Ստանում ենք Logits-ները Qwen-ից
+logits = model.get_logits_from_input_ids(input_ids)
+logits_arr = np.array(logits)
 
-    if all_passed:
-        print("🎉 Շնորհավորում եմ! Քո զրոյից գրած BPE Tokenizer-ը աշխատում է 100% ճշգրտությամբ:")
-    else:
-        print("⚠️ Որոշ թեստեր ձախողվեցին: Պետք է լավարկել BPE merge-ի տրամաբանությունը:")
+# 4. Գտնում ենք Top 10 ամենաբարձր logit ունեցող թոքենների ID-ները
+top_k = 10
+top_indices = np.argsort(logits_arr)[-top_k:][::-1]
 
-if __name__ == "__main__":
-    test_my_tokenizer()
+print(f"Prompt: '{prompt}'\n")
+print(f"{'Rank':<5} | {'Token ID':<10} | {'Logit Score':<12} | {'Decoded Text'}")
+print("-" * 50)
+
+for rank, token_id in enumerate(top_indices, 1):
+    score = logits_arr[token_id]
+    # Decode ենք անում միայն տվյալ թոքենը
+    token_str = tokenizer.decode([token_id])
+    # Տերմինալում գեղեցիկ ցույց տալու համար
+    printable_str = repr(token_str)
+    print(f"{rank:<5} | {token_id:<10} | {score:<12.4f} | {printable_str}")
