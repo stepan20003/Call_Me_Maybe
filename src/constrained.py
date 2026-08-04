@@ -1,18 +1,152 @@
-"""Constrained decoding implementation for structured JSON generation with schema type enforcement."""
+"""Constrained decoding implementation for structured JSON generation with state machine, cache, and schema-level type enforcement."""
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from src.models import FunctionDefinition
 from src.tokenizer import ByteLevelBPETokenizer
 
 
-class JSONConstraintDecoder:
-    """Schema-level JSON constraint decoder with robust state extraction and type checks."""
+class JSONStateValidator:
+    """Pushdown Automaton State Validator for JSON syntax and primitive schema types."""
 
-    NUMBER_PATTERN = re.compile(r"^-?\d*\.?\d*$")
+    NUMBER_PREFIX = re.compile(r"^-?\d*\.?\d*$")
+
+    @staticmethod
+    def extract_function(text: str) -> Optional[str]:
+        """Extract function name currently specified in the JSON text."""
+        if '"name":' not in text:
+            return None
+        try:
+            after_name = text.split('"name":')[1].strip()
+            if after_name.startswith('"'):
+                parts = after_name.split('"')
+                if len(parts) >= 2:
+                    return parts[1]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def get_active_parameter(text: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract the last active parameter key name and its current unparsed value snippet."""
+        if '"parameters":' not in text:
+            return None, None
+
+        params_blob = text.split('"parameters":', 1)[1]
+        matches = list(re.finditer(r'"([^"]+)"\s*:\s*', params_blob))
+
+        if not matches:
+            return None, None
+
+        last_match = matches[-1]
+        param_name = last_match.group(1)
+        value_snippet = params_blob[last_match.end() :].strip()
+
+        return param_name, value_snippet
+
+    @staticmethod
+    def validate_parameter(value: str, expected_type: str) -> bool:
+        """Validate if active parameter value snippet satisfies primitive schema constraints."""
+        val = value.strip()
+        if not val:
+            return True
+
+        if expected_type == "number":
+            if val.startswith('"'):
+                return False
+            val_clean = val.rstrip(",}").strip()
+            return bool(JSONStateValidator.NUMBER_PREFIX.match(val_clean))
+
+        if expected_type == "string":
+            return val.startswith('"')
+
+        if expected_type == "boolean":
+            val_clean = val.rstrip(",}").strip()
+            return "true".startswith(val_clean) or "false".startswith(val_clean)
+
+        return True
+
+    @staticmethod
+    def validate_prefix(
+        text: str, functions: Dict[str, FunctionDefinition]
+    ) -> bool:
+        """Validate candidate text against JSON syntax and active function parameter types."""
+        stripped = text.strip()
+        if not stripped:
+            return True
+        if not stripped.startswith("{"):
+            return False
+
+        # 1. Structural Bracket Balance & String Escape Check
+        in_string = False
+        escape = False
+        stack: list[str] = []
+
+        for char in text:
+            if escape:
+                escape = False
+                continue
+            if char == "\\" and in_string:
+                escape = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+
+            if char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                if not stack:
+                    return False
+                top = stack.pop()
+                if (char == "}" and top != "{") or (char == "]" and top != "["):
+                    return False
+
+        # 2. Function Name Constraint Validation
+        valid_fn_names = set(functions.keys())
+        fn_name = JSONStateValidator.extract_function(text)
+
+        if fn_name:
+            if fn_name not in valid_fn_names:
+                if not any(f.startswith(fn_name) for f in valid_fn_names):
+                    return False
+
+        # 3. Parameter Schema Type Validation (Number / String / Boolean)
+        if fn_name and fn_name in functions:
+            param_name, val_snippet = JSONStateValidator.get_active_parameter(
+                text
+            )
+            if param_name and val_snippet is not None:
+                schema = functions[fn_name]
+                if (
+                    schema.parameters
+                    and param_name in schema.parameters
+                ):
+                    param_type = schema.parameters[param_name].type
+                    if not JSONStateValidator.validate_parameter(
+                        val_snippet, param_type
+                    ):
+                        return False
+
+        # 4. JSON Syntax Prefix Check
+        try:
+            json.loads(text)
+            return True
+        except json.JSONDecodeError as e:
+            msg = str(e)
+            return any(
+                term in msg
+                for term in ["Unterminated string", "Expecting", "end of file"]
+            )
+
+
+class JSONConstraintDecoder:
+    """Fast Top-K schema-aware JSON constraint decoder with state tracking and caching."""
 
     def __init__(
         self,
@@ -25,10 +159,8 @@ class JSONConstraintDecoder:
         self.vocab = vocab
         self.tokenizer = tokenizer
         self.functions_def = {fn.name: fn for fn in functions_def}
-        self.valid_names = set(self.functions_def.keys())
         self.top_k = top_k
 
-        # Pre-cache single token IDs to string mappings for O(1) lookup
         self.id_to_str: Dict[int, str] = {}
         for _, token_id in vocab.items():
             try:
@@ -37,9 +169,23 @@ class JSONConstraintDecoder:
                 self.id_to_str[token_id] = ""
 
         self.valid_cache: Dict[Tuple[str, Tuple[int, ...]], Set[int]] = {}
+        self.prefix_cache: Dict[str, bool] = {}
 
-    def mask_logits(self, logits: List[float], generated_text: str) -> List[float]:
-        """Filter logits by evaluating candidates against JSON syntax and schema types."""
+    def validate_prefix_cached(self, candidate: str) -> bool:
+        """Check and cache candidate text validity to optimize PDA character scanning."""
+        if candidate in self.prefix_cache:
+            return self.prefix_cache[candidate]
+
+        is_valid = JSONStateValidator.validate_prefix(
+            candidate, self.functions_def
+        )
+        self.prefix_cache[candidate] = is_valid
+        return is_valid
+
+    def mask_logits(
+        self, logits: List[float], generated_text: str
+    ) -> List[float]:
+        """Filter logits by evaluating candidate tokens against JSON state machine and parameter schema."""
         valid_ids = self.get_valid_token_ids(generated_text, logits)
 
         if not valid_ids:
@@ -52,9 +198,11 @@ class JSONConstraintDecoder:
 
         return masked_logits.tolist()  # type: ignore[no-any-return]
 
-    def get_valid_token_ids(self, current_text: str, logits: List[float]) -> Set[int]:
-        """Filter candidate tokens using Top-K ranking, caching, and schema state checks."""
-        top_k_indices = np.argpartition(logits, -self.top_k)[-self.top_k:]
+    def get_valid_token_ids(
+        self, current_text: str, logits: List[float]
+    ) -> Set[int]:
+        """Filter candidate tokens using Top-K ranking, state caching, and schema checks."""
+        top_k_indices = np.argpartition(logits, -self.top_k)[-self.top_k :]
         top_k_tuple = tuple(int(idx) for idx in top_k_indices)
 
         cache_key = (current_text, top_k_tuple)
@@ -71,117 +219,8 @@ class JSONConstraintDecoder:
 
             candidate = current_text + token_str
 
-            if self._is_valid_schema_prefix(candidate):
+            if self.validate_prefix_cached(candidate):
                 valid_ids.add(int(token_id))
 
         self.valid_cache[cache_key] = valid_ids
         return valid_ids
-
-    def _extract_selected_function(self, text: str) -> Optional[str]:
-        """Extract function name currently specified in the JSON text."""
-        if '"name":' not in text:
-            return None
-        try:
-            after_name = text.split('"name":')[1].strip()
-            if after_name.startswith('"'):
-                parts = after_name.split('"')
-                if len(parts) >= 2:
-                    return parts[1]
-        except Exception:
-            pass
-        return None
-
-    def _extract_active_parameter_state(self, text: str) -> Tuple[Optional[str], str]:
-        """Extract active parameter key name and its current unparsed value snippet."""
-        if '"parameters":' not in text:
-            return None, ""
-
-        params_blob = text.split('"parameters":')[1].strip()
-        if not params_blob.startswith("{"):
-            return None, ""
-
-        # Find the last key-value pair being written
-        matches = list(re.finditer(r'"([a-zA-Z0-9_]+)"\s*:\s*', params_blob))
-        if not matches:
-            return None, ""
-
-        last_match = matches[-1]
-        param_name = last_match.group(1)
-        value_snippet = params_blob[last_match.end() :].strip()
-
-        return param_name, value_snippet
-
-    def _get_parameter_type_schema(
-        self, fn_schema: FunctionDefinition, param_name: str
-    ) -> Optional[str]:
-        """Extract type string safely regardless of Pydantic model parameter structure."""
-        params_def = fn_schema.parameters
-        if isinstance(params_def, dict):
-            param_info = params_def.get(param_name)
-            if isinstance(param_info, dict):
-                return str(param_info.get("type", ""))
-            elif hasattr(param_info, "type"):
-                return str(getattr(param_info, "type"))
-        return None
-
-    def _validate_parameter_type(self, val_str: str, expected_type: str) -> bool:
-        """Validate if active parameter value snippet satisfies primitive schema constraints."""
-        if not val_str:
-            return True
-
-        if expected_type == "number":
-            # Disallow string quotes
-            if val_str.startswith('"'):
-                return False
-            # Check prefix against number regex
-            clean_val = val_str.rstrip(",}").strip()
-            if clean_val and not self.NUMBER_PATTERN.match(clean_val):
-                return False
-
-        elif expected_type == "string":
-            # String value must start with quote once typing has begun
-            if not val_str.startswith('"'):
-                return False
-
-        elif expected_type == "boolean":
-            clean_val = val_str.rstrip(",}").strip()
-            if clean_val:
-                if not ("true".startswith(clean_val) or "false".startswith(clean_val)):
-                    return False
-
-        return True
-
-    def _is_valid_schema_prefix(self, text: str) -> bool:
-        """Validate candidate text against JSON syntax and active function parameter types."""
-        stripped = text.strip()
-        if not stripped:
-            return True
-        if not stripped.startswith("{"):
-            return False
-
-        # 1. Function name validity check
-        selected_fn_name = self._extract_selected_function(text)
-        if selected_fn_name and selected_fn_name not in self.valid_names:
-            # Check if fn_name is a prefix of any valid function name
-            if not any(fn.startswith(selected_fn_name) for fn in self.valid_names):
-                return False
-
-        # 2. Parameter Type Enforcement
-        if selected_fn_name and selected_fn_name in self.functions_def:
-            fn_schema = self.functions_def[selected_fn_name]
-            param_name, val_snippet = self._extract_active_parameter_state(text)
-
-            if param_name:
-                expected_type = self._get_parameter_type_schema(fn_schema, param_name)
-                if expected_type and not self._validate_parameter_type(val_snippet, expected_type):
-                    return False
-
-        # 3. Overall JSON syntax prefix validation
-        try:
-            json.loads(text)
-            return True
-        except json.JSONDecodeError as e:
-            msg = str(e)
-            if "Unterminated string" in msg or "Expecting" in msg or "end of file" in msg:
-                return True
-            return False
