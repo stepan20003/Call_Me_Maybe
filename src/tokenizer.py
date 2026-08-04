@@ -1,162 +1,127 @@
-"""Custom Byte-Level BPE Tokenizer implementation for LLM models."""
-
+# tokenizer.py
 import json
-import re
-from typing import Dict, List, Optional, Set, Tuple
+from .unicode_map import bytes_to_unicode
+from .pretokenizer import PreTokenizer, RegexPreTokenizer
+from .bpe import BPE
 
 
-def bytes_to_unicode() -> Dict[int, str]:
-    """Map ASCII and Unicode bytes to visual representation strings.
+class ByteLevelBPETokenizer:
+    """Byte-Level BPE Tokenizer compatible with Hugging Face models using vocab.json and merges.txt."""
 
-    Returns:
-        Dict[int, str]: A mapping from byte integers to unicode characters.
-    """
-    bs = (
-        list(range(ord("!"), ord("~") + 1))
-        + list(range(ord("¡"), ord("¬") + 1))
-        + list(range(ord("®"), ord("ÿ") + 1))
-    )
-    cs = bs[:]
-    n = 0
-    for b in range(256):
-        if b not in bs:
-            bs.append(b)
-            cs.append(256 + n)
-            n += 1
-    cs_str = [chr(x) for x in cs]
-    return dict(zip(bs, cs_str))
-
-
-class CustomTokenizer:
-    """Custom BPE Tokenizer for encoding and decoding text without external LLM libs."""
-
-    def __init__(self, vocab_file_path: str, merges_file_path: Optional[str] = None) -> None:
-        """Initialize the tokenizer from a vocab or tokenizer.json file.
-
-        Args:
-            vocab_file_path: Path to the vocabulary JSON file provided by the SDK.
+    def __init__(
+        self,
+        vocab_path: str,
+        merges_path: str,
+        pre_tokenizer: PreTokenizer | None = None,
+        unk_token: str | None = None,
+    ):
         """
-        self.byte_encoder: Dict[int, str] = bytes_to_unicode()
-        self.byte_decoder: Dict[str, int] = {
-            v: k for k, v in self.byte_encoder.items()
-        }
-        
-        self.vocab: Dict[str, int] = {}
-        self.bpe_ranks: Dict[Tuple[str, str], int] = {}
-
-        with open(vocab_file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Ստուգում ենք՝ արդյոք data-ն HuggingFace tokenizer.json է
-        if isinstance(data, dict) and "model" in data and isinstance(data["model"], dict):
-            if "vocab" in data["model"] and isinstance(data["model"]["vocab"], dict):
-                self.vocab = data["model"]["vocab"]
-                merges = data["model"].get("merges", [])
-                for idx, merge_str in enumerate(merges):
-                    if isinstance(merge_str, str):
-                        parts = tuple(merge_str.split())
-                        if len(parts) == 2:
-                            self.bpe_ranks[(parts[0], parts[1])] = idx
-        # Եթե data-ն ուղղակի {"token_str": id} կամ {id: "token_str"} բառարան է
-        elif isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(k, str) and isinstance(v, int):
-                    self.vocab[k] = v
-                elif isinstance(v, str):
-                    self.vocab[v] = int(k)
-
-        self.index_to_token: Dict[int, str] = {
-            v: k for k, v in self.vocab.items()
-        }
-
-        # Regex pre-tokenization pattern
-        # Standard Python re compatible pattern for Unicode pre-tokenization
-        self.pat = re.compile(
-            r"""'s|'t|'re|'ve|'m|'ll|'d| ?[^\s\w\d]+|\s+(?!\S)|\s+| ?\w+| ?\d+""",
-            re.UNICODE,
-        )
-
-    def _get_pairs(self, word: List[str]) -> Set[Tuple[str, str]]:
-        """Extract adjacent pairs of symbols from a word.
+        Initializes the ByteLevelBPETokenizer instance.
 
         Args:
-            word: List of string symbols.
+            vocab_path: Path to JSON file containing token-to-ID mappings.
+            merges_path: Path to text file containing BPE merge rules.
+            pre_tokenizer: Custom PreTokenizer strategy. Defaults to RegexPreTokenizer.
+            unk_token: Fallback token representation for unknown tokens.
+        """
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            self.token_to_id: dict[str, int] = json.load(f)
+
+        self.id_to_token: dict[int, str] = {v: k for k, v in self.token_to_id.items()}
+
+        merges = []
+        with open(merges_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) == 2:
+                    merges.append((parts[0], parts[1]))
+
+        self.bpe = BPE(merges)
+        self.pre_tokenizer = pre_tokenizer or RegexPreTokenizer()
+        self.unk_token = unk_token
+
+        self.byte_encoder = bytes_to_unicode()
+        self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
+
+        self.byte_piece_cache: dict[str, str] = {}
+        self.unk_token_id = self.token_to_id.get(unk_token) if unk_token else None
+
+    def _piece_to_byte_string(self, piece: str) -> str:
+        """
+        Encodes a string piece into a byte-level representation mapping using byte_encoder.
+
+        Args:
+            piece: Substring piece to be byte-encoded.
 
         Returns:
-            Set[Tuple[str, str]]: Set of symbol pairs.
+            Mapped byte-level unicode string representation.
         """
-        pairs: Set[Tuple[str, str]] = set()
-        for i in range(len(word) - 1):
-            pairs.add((word[i], word[i + 1]))
-        return pairs
-
-    def _bpe(self, token: str) -> List[str]:
-        """Apply BPE merge operations to a single token string.
-
-        Args:
-            token: Raw string token.
-
-        Returns:
-            List[str]: List of merged subword tokens.
-        """
-        token_bytes = [self.byte_encoder[b] for b in token.encode("utf-8")]
-        word = token_bytes
-        pairs = self._get_pairs(word)
-
-        if not pairs:
-            return word
-
-        while True:
-            # Գտնում ենք ամենափոքր rank (ամենաբարձր առաջնահերթություն) ունեցող զույգը
-            bigram = min(
-                pairs,
-                key=lambda pair: self.bpe_ranks.get(pair, float("inf")),
+        if piece not in self.byte_piece_cache:
+            self.byte_piece_cache[piece] = "".join(
+                self.byte_encoder[b] for b in piece.encode("utf-8")
             )
-            if bigram not in self.bpe_ranks:
-                break
+        return self.byte_piece_cache[piece]
 
-            new_word: List[str] = []
-            i = 0
-            while i < len(word):
-                if i < len(word) - 1 and (word[i], word[i + 1]) == bigram:
-                    new_word.append(word[i] + word[i + 1])
-                    i += 2
-                else:
-                    new_word.append(word[i])
-                    i += 1
-            word = new_word
-            pairs = self._get_pairs(word)
-            if not pairs:
-                break
-
-        return word
-
-    def encode(self, text: str) -> List[int]:
-        """Encode string text into a list of token IDs."""
-        if not text:
-            return []
-
-        bpe_tokens: List[int] = []
-        matches = self.pat.findall(text)
-        for match in matches:
-            for bpe_token in self._bpe(match):
-                if bpe_token in self.vocab:
-                    bpe_tokens.append(self.vocab[bpe_token])
-
-        return bpe_tokens
-
-    def decode(self, token_ids: List[int]) -> str:
-        """Decode a list of token IDs back into a UTF-8 string.
+    def encode(self, text: str) -> list[int]:
+        """
+        Encodes raw text string into a list of integer token IDs.
 
         Args:
-            token_ids: List of integer token IDs.
+            text: Raw input text string.
 
         Returns:
-            str: Decoded UTF-8 string.
+            List of integer token IDs.
+
+        Raises:
+            KeyError: If a generated token is not present in the vocabulary and no unk_token is provided.
         """
-        text = "".join([self.index_to_token.get(tid, "") for tid in token_ids])
-        byte_list = [
-            self.byte_decoder[c] if c in self.byte_decoder else ord(c)
-            for c in text
-        ]
-        return bytes(byte_list).decode("utf-8", errors="replace")
+        ids: list[int] = []
+        pieces = self.pre_tokenizer.pre_tokenize(text)
+
+        for piece in pieces:
+            byte_piece = self._piece_to_byte_string(piece)
+            bpe_tokens = self.bpe.encode_piece(byte_piece)
+
+            for token in bpe_tokens:
+                token_id = self.token_to_id.get(token)
+                if token_id is not None:
+                    ids.append(token_id)
+                elif self.unk_token_id is not None:
+                    ids.append(self.unk_token_id)
+                else:
+                    raise KeyError(f"Token '{token}' not found in vocabulary.")
+
+        return ids
+
+    def decode(self, ids: list[int]) -> str:
+        """
+        Decodes a list of token IDs back into a reconstructed text string.
+
+        Args:
+            ids: List of integer token IDs.
+
+        Returns:
+            Decoded UTF-8 text string.
+
+        Raises:
+            KeyError: If a token ID is not recognized or mapped byte cannot be decoded.
+        """
+        tokens = []
+        for i in ids:
+            token = self.id_to_token.get(i)
+            if token is not None:
+                tokens.append(token)
+            else:
+                raise KeyError(f"ID {i} not found in vocabulary.")
+
+        text_encoded = "".join(tokens)
+
+        try:
+            raw_bytes = bytes(self.byte_decoder[c] for c in text_encoded)
+        except KeyError as e:
+            raise KeyError(f"Character {e} not found in byte decoder.") from e
+
+        return raw_bytes.decode("utf-8", errors="replace")
