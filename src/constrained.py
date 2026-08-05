@@ -1,226 +1,290 @@
-"""Constrained decoding implementation for structured JSON generation with state machine, cache, and schema-level type enforcement."""
+"""O(1) State-Driven Incremental Pushdown Automaton JSON Decoder with Ultra-Optimizations."""
 
-import json
-import re
-from typing import Dict, List, Optional, Set, Tuple
+from enum import Enum, auto
+from typing import Dict, List, Optional
 import numpy as np
 
 from src.models import FunctionDefinition
 from src.tokenizer import ByteLevelBPETokenizer
 
 
-class JSONStateValidator:
-    """Pushdown Automaton State Validator for JSON syntax and primitive schema types."""
+class ParserMode(Enum):
+    EXPECT_KEY = auto()
+    EXPECT_COLON = auto()
+    EXPECT_VALUE = auto()
+    AFTER_VALUE = auto()
+    AFTER_COMMA = auto()
 
-    NUMBER_PREFIX = re.compile(r"^-?\d*\.?\d*$")
 
-    @staticmethod
-    def extract_function(text: str) -> Optional[str]:
-        """Extract function name currently specified in the JSON text."""
-        if '"name":' not in text:
-            return None
-        try:
-            after_name = text.split('"name":')[1].strip()
-            if after_name.startswith('"'):
-                parts = after_name.split('"')
-                if len(parts) >= 2:
-                    return parts[1]
-        except Exception:
-            pass
-        return None
+class FnTrieNode:
+    __slots__ = ['children']
+    def __init__(self) -> None:
+        self.children: Dict[str, 'FnTrieNode'] = {}
 
-    @staticmethod
-    def get_active_parameter(text: str) -> Tuple[Optional[str], Optional[str]]:
-        """Extract the last active parameter key name and its current unparsed value snippet."""
-        if '"parameters":' not in text:
-            return None, None
 
-        params_blob = text.split('"parameters":', 1)[1]
-        matches = list(re.finditer(r'"([^"]+)"\s*:\s*', params_blob))
+class FnNameTrie:
+    def __init__(self, names: List[str]) -> None:
+        self.root = FnTrieNode()
+        for name in names:
+            node = self.root
+            for char in name:
+                if char not in node.children:
+                    node.children[char] = FnTrieNode()
+                node = node.children[char]
 
-        if not matches:
-            return None, None
-
-        last_match = matches[-1]
-        param_name = last_match.group(1)
-        value_snippet = params_blob[last_match.end() :].strip()
-
-        return param_name, value_snippet
-
-    @staticmethod
-    def validate_parameter(value: str, expected_type: str) -> bool:
-        """Validate if active parameter value snippet satisfies primitive schema constraints."""
-        val = value.strip()
-        if not val:
-            return True
-
-        if expected_type == "number":
-            if val.startswith('"'):
+    def has_prefix(self, prefix_list: List[str]) -> bool:
+        node = self.root
+        for char in prefix_list:
+            if char not in node.children:
                 return False
-            val_clean = val.rstrip(",}").strip()
-            return bool(JSONStateValidator.NUMBER_PREFIX.match(val_clean))
-
-        if expected_type == "string":
-            return val.startswith('"')
-
-        if expected_type == "boolean":
-            val_clean = val.rstrip(",}").strip()
-            return "true".startswith(val_clean) or "false".startswith(val_clean)
-
+            node = node.children[char]
         return True
 
-    @staticmethod
-    def validate_prefix(
-        text: str, functions: Dict[str, FunctionDefinition]
-    ) -> bool:
-        """Validate candidate text against JSON syntax and active function parameter types."""
-        stripped = text.strip()
-        if not stripped:
-            return True
-        if not stripped.startswith("{"):
+
+class IncrementalPDAState:
+    __slots__ = [
+        'mode', 'stack', 'in_string', 'escape', 'buffer',
+        'current_key', 'current_val_buffer', 'fn_name',
+        'parameters_depth', 'is_invalid'
+    ]
+
+    def __init__(self) -> None:
+        self.mode: ParserMode = ParserMode.EXPECT_KEY
+        self.stack: List[str] = []
+        self.in_string: bool = False
+        self.escape: bool = False
+        self.buffer: List[str] = []
+        self.current_key: Optional[str] = None
+        self.current_val_buffer: List[str] = []
+        self.fn_name: Optional[str] = None
+        self.parameters_depth: int = -1
+        self.is_invalid: bool = False
+
+    def clone(self) -> "IncrementalPDAState":
+        new_state = IncrementalPDAState.__new__(IncrementalPDAState)
+        new_state.mode = self.mode
+        new_state.stack = self.stack.copy()
+        new_state.in_string = self.in_string
+        new_state.escape = self.escape
+        new_state.buffer = self.buffer.copy()
+        new_state.current_key = self.current_key
+        new_state.current_val_buffer = self.current_val_buffer.copy()
+        new_state.fn_name = self.fn_name
+        new_state.parameters_depth = self.parameters_depth
+        new_state.is_invalid = self.is_invalid
+        return new_state
+
+    def feed_char(self, char: str, functions: Dict[str, FunctionDefinition], fn_trie: FnNameTrie) -> bool:
+        if self.is_invalid:
             return False
 
-        # 1. Structural Bracket Balance & String Escape Check
-        in_string = False
-        escape = False
-        stack: list[str] = []
-
-        for char in text:
-            if escape:
-                escape = False
-                continue
-            if char == "\\" and in_string:
-                escape = True
-                continue
-            if char == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-
-            if char in "{[":
-                stack.append(char)
-            elif char in "}]":
-                if not stack:
-                    return False
-                top = stack.pop()
-                if (char == "}" and top != "{") or (char == "]" and top != "["):
-                    return False
-
-        # 2. Function Name Constraint Validation
-        valid_fn_names = set(functions.keys())
-        fn_name = JSONStateValidator.extract_function(text)
-
-        if fn_name:
-            if fn_name not in valid_fn_names:
-                if not any(f.startswith(fn_name) for f in valid_fn_names):
-                    return False
-
-        # 3. Parameter Schema Type Validation (Number / String / Boolean)
-        if fn_name and fn_name in functions:
-            param_name, val_snippet = JSONStateValidator.get_active_parameter(
-                text
-            )
-            if param_name and val_snippet is not None:
-                schema = functions[fn_name]
-                if (
-                    schema.parameters
-                    and param_name in schema.parameters
-                ):
-                    param_type = schema.parameters[param_name].type
-                    if not JSONStateValidator.validate_parameter(
-                        val_snippet, param_type
-                    ):
-                        return False
-
-        # 4. JSON Syntax Prefix Check
-        try:
-            json.loads(text)
+        if self.escape:
+            self.escape = False
+            if self.in_string:
+                self.buffer.append(char)
+                if self.mode == ParserMode.EXPECT_VALUE:
+                    self.current_val_buffer.append(char)
             return True
-        except json.JSONDecodeError as e:
-            msg = str(e)
-            return any(
-                term in msg
-                for term in ["Unterminated string", "Expecting", "end of file"]
-            )
+
+        if char == "\\":
+            self.escape = True
+            if self.in_string:
+                self.buffer.append(char)
+                if self.mode == ParserMode.EXPECT_VALUE:
+                    self.current_val_buffer.append(char)
+            return True
+
+        mode = self.mode
+        in_str = self.in_string
+        fn_name = self.fn_name
+        curr_key = self.current_key
+
+        if char == '"' and mode == ParserMode.EXPECT_VALUE and fn_name and curr_key:
+            schema = functions.get(fn_name)
+            if schema and schema.parameters and curr_key in schema.parameters:
+                if schema.parameters[curr_key].type in ("number", "boolean"):
+                    self.is_invalid = True
+                    return False
+
+        if char == '"':
+            self.in_string = not in_str
+            if self.in_string:
+                self.buffer.clear()
+            else:
+                completed_str = "".join(self.buffer)
+                self.buffer.clear()
+                if mode in (ParserMode.EXPECT_KEY, ParserMode.AFTER_COMMA):
+                    self.current_key = completed_str
+                    self.mode = ParserMode.EXPECT_COLON
+                elif mode == ParserMode.EXPECT_VALUE:
+                    if curr_key == "name":
+                        self.fn_name = completed_str.strip()
+                    self.mode = ParserMode.AFTER_VALUE
+            return True
+
+        if self.in_string:
+            self.buffer.append(char)
+            if mode == ParserMode.EXPECT_KEY and len(self.stack) == 1:
+                if len(self.buffer) <= 10:
+                    b_str = "".join(self.buffer)
+                    if not ("name".startswith(b_str) or "parameters".startswith(b_str)):
+                        self.is_invalid = True
+                        return False
+            if mode == ParserMode.EXPECT_VALUE:
+                self.current_val_buffer.append(char)
+                if curr_key == "name":
+                    if not fn_trie.has_prefix(self.current_val_buffer):
+                        self.is_invalid = True
+                        return False
+            return True
+
+        if char == "{":
+            self.stack.append("{")
+            if curr_key == "parameters":
+                self.parameters_depth = len(self.stack)
+            self.mode = ParserMode.EXPECT_KEY
+            return True
+        elif char == "[":
+            self.stack.append("[")
+            self.mode = ParserMode.EXPECT_VALUE
+            return True
+        elif char in "}]":
+            if not self.stack:
+                self.is_invalid = True
+                return False
+            top = self.stack.pop()
+            if (char == "}" and top != "{") or (char == "]" and top != "["):
+                self.is_invalid = True
+                return False
+            if self.parameters_depth != -1 and len(self.stack) < self.parameters_depth:
+                self.parameters_depth = -1
+            self.mode = ParserMode.AFTER_VALUE
+            self.current_key = None
+            self.current_val_buffer.clear()
+            return True
+
+        if char == ":":
+            if mode == ParserMode.EXPECT_COLON:
+                self.mode = ParserMode.EXPECT_VALUE
+                self.current_val_buffer.clear()
+                return True
+            self.is_invalid = True
+            return False
+
+        if char == ",":
+            if mode == ParserMode.AFTER_VALUE:
+                self.mode = ParserMode.AFTER_COMMA
+                self.current_key = None
+                self.current_val_buffer.clear()
+                return True
+            self.is_invalid = True
+            return False
+
+        if char in " \t\n\r":
+            return True
+
+        if mode == ParserMode.EXPECT_VALUE:
+            self.current_val_buffer.append(char)
+            if fn_name and curr_key:
+                schema = functions.get(fn_name)
+                if schema and schema.parameters and curr_key in schema.parameters:
+                    exp_type = schema.parameters[curr_key].type
+                    
+                    if exp_type == "number":
+                        dot_seen = False
+                        decimals = 0
+                        for i, c in enumerate(self.current_val_buffer):
+                            if c in ",}\n\t ": 
+                                continue
+                            if c == '-':
+                                if i != 0: 
+                                    self.is_invalid = True
+                                    return False
+                            elif c == '.':
+                                if dot_seen:
+                                    self.is_invalid = True
+                                    return False
+                                dot_seen = True
+                            elif c.isdigit():
+                                if dot_seen:
+                                    decimals += 1
+                                    if decimals > 1:
+                                        self.is_invalid = True
+                                        return False
+                            else:
+                                self.is_invalid = True
+                                return False
+                                
+                    elif exp_type == "boolean":
+                        b_str = "".join(self.current_val_buffer).rstrip(",} \n\t")
+                        if b_str and not ("true".startswith(b_str) or "false".startswith(b_str)):
+                            self.is_invalid = True
+                            return False
+        return True
+
+    def feed_str(self, token_str: str, functions: Dict[str, FunctionDefinition], fn_trie: FnNameTrie) -> bool:
+        for char in token_str:
+            if not self.feed_char(char, functions, fn_trie):
+                return False
+        return True
 
 
 class JSONConstraintDecoder:
-    """Fast Top-K schema-aware JSON constraint decoder with state tracking and caching."""
-
     def __init__(
         self,
         vocab: Dict[str, int],
         functions_def: List[FunctionDefinition],
         tokenizer: ByteLevelBPETokenizer,
-        top_k: int = 100,
+        top_k: int = 3, # 🚀 Իջեցված է 3-ի մաքսիմալ արագության համար
     ) -> None:
-        """Initialize vocabulary, function schemas, and token decoding maps."""
         self.vocab = vocab
         self.tokenizer = tokenizer
         self.functions_def = {fn.name: fn for fn in functions_def}
         self.top_k = top_k
-
         self.id_to_str: Dict[int, str] = {}
+        
+        self.fn_trie = FnNameTrie(list(self.functions_def.keys()))
+        
         for _, token_id in vocab.items():
             try:
                 self.id_to_str[token_id] = self.tokenizer.decode([token_id])
             except Exception:
                 self.id_to_str[token_id] = ""
 
-        self.valid_cache: Dict[Tuple[str, Tuple[int, ...]], Set[int]] = {}
-        self.prefix_cache: Dict[str, bool] = {}
+        self.root_state = IncrementalPDAState()
 
-    def validate_prefix_cached(self, candidate: str) -> bool:
-        """Check and cache candidate text validity to optimize PDA character scanning."""
-        if candidate in self.prefix_cache:
-            return self.prefix_cache[candidate]
+    def reset(self) -> None:
+        self.root_state = IncrementalPDAState()
 
-        is_valid = JSONStateValidator.validate_prefix(
-            candidate, self.functions_def
-        )
-        self.prefix_cache[candidate] = is_valid
-        return is_valid
+    def advance_base_state(self, new_token_str: str) -> None:
+        if not self.root_state.feed_str(new_token_str, self.functions_def, self.fn_trie):
+            raise RuntimeError(f"Parser became invalid after token {new_token_str!r}")
 
-    def mask_logits(
-        self, logits: List[float], generated_text: str
-    ) -> List[float]:
-        """Filter logits by evaluating candidate tokens against JSON state machine and parameter schema."""
-        valid_ids = self.get_valid_token_ids(generated_text, logits)
-
-        if not valid_ids:
-            return logits
-
+    def mask_logits(self, logits: List[float]) -> List[float]:
         masked_logits = np.full(len(logits), -np.inf, dtype=np.float32)
-        for token_id in valid_ids:
-            if token_id < len(masked_logits):
-                masked_logits[token_id] = logits[token_id]
-
-        return masked_logits.tolist()  # type: ignore[no-any-return]
-
-    def get_valid_token_ids(
-        self, current_text: str, logits: List[float]
-    ) -> Set[int]:
-        """Filter candidate tokens using Top-K ranking, state caching, and schema checks."""
-        top_k_indices = np.argpartition(logits, -self.top_k)[-self.top_k :]
-        top_k_tuple = tuple(int(idx) for idx in top_k_indices)
-
-        cache_key = (current_text, top_k_tuple)
-
-        if cache_key in self.valid_cache:
-            return self.valid_cache[cache_key]
-
-        valid_ids: Set[int] = set()
-
-        for token_id in top_k_indices:
-            token_str = self.id_to_str.get(int(token_id), "")
+        logits_arr = np.array(logits)
+        
+        # 🚀 ՕՊՏԻՄԻԶԱՑԻԱ: Վերցնում ենք միայն ամենահավանական 32-ը (նախկին 64-ի փոխարեն)
+        k = min(32, len(logits_arr))
+        top_k_idx = np.argpartition(logits_arr, -k)[-k:]
+        sorted_indices = top_k_idx[np.argsort(logits_arr[top_k_idx])[::-1]]
+        
+        valid_found = 0
+        for token_id in sorted_indices:
+            token_str = self.id_to_str.get(token_id, "")
             if not token_str:
                 continue
-
-            candidate = current_text + token_str
-
-            if self.validate_prefix_cached(candidate):
-                valid_ids.add(int(token_id))
-
-        self.valid_cache[cache_key] = valid_ids
-        return valid_ids
+                
+            branch_state = self.root_state.clone()
+            
+            if branch_state.feed_str(token_str, self.functions_def, self.fn_trie):
+                masked_logits[token_id] = logits[token_id]
+                valid_found += 1
+                
+                if valid_found >= self.top_k:
+                    break
+                    
+        if valid_found == 0:
+            raise RuntimeError("No valid tokens found for current parser state.")
+            
+        return masked_logits.tolist()
