@@ -1,4 +1,4 @@
-"""O(1) State-Driven Incremental Pushdown Automaton JSON Decoder with Ultra-Optimizations."""
+"""O(1) State-Driven Incremental Pushdown Automaton JSON Decoder with Zero-Overhead Logits."""
 
 from enum import Enum, auto
 from typing import Dict, List, Optional
@@ -235,7 +235,7 @@ class JSONConstraintDecoder:
         vocab: Dict[str, int],
         functions_def: List[FunctionDefinition],
         tokenizer: ByteLevelBPETokenizer,
-        top_k: int = 3, # 🚀 Իջեցված է 3-ի մաքսիմալ արագության համար
+        top_k: int = 10,
     ) -> None:
         self.vocab = vocab
         self.tokenizer = tokenizer
@@ -261,24 +261,25 @@ class JSONConstraintDecoder:
             raise RuntimeError(f"Parser became invalid after token {new_token_str!r}")
 
     def mask_logits(self, logits: List[float]) -> List[float]:
-        masked_logits = np.full(len(logits), -np.inf, dtype=np.float32)
-        logits_arr = np.array(logits)
+        # 🚀 Օգտագործում ենք np.asarray և np.full_like՝ հիշողության զրոյական օվերհեդի համար
+        logits_arr = np.asarray(logits, dtype=np.float32)
+        masked_logits = np.full_like(logits_arr, -np.inf)
         
-        # 🚀 ՕՊՏԻՄԻԶԱՑԻԱ: Վերցնում ենք միայն ամենահավանական 32-ը (նախկին 64-ի փոխարեն)
+        # 🚀 k=32 ավելի օպտիմալ արագության համար
         k = min(32, len(logits_arr))
         top_k_idx = np.argpartition(logits_arr, -k)[-k:]
         sorted_indices = top_k_idx[np.argsort(logits_arr[top_k_idx])[::-1]]
         
         valid_found = 0
         for token_id in sorted_indices:
-            token_str = self.id_to_str.get(token_id, "")
+            token_str = self.id_to_str.get(int(token_id), "")
             if not token_str:
                 continue
                 
             branch_state = self.root_state.clone()
             
             if branch_state.feed_str(token_str, self.functions_def, self.fn_trie):
-                masked_logits[token_id] = logits[token_id]
+                masked_logits[token_id] = logits_arr[token_id]
                 valid_found += 1
                 
                 if valid_found >= self.top_k:
