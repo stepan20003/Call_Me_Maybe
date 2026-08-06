@@ -117,37 +117,44 @@ class IncrementalPDAState:
                     self.current_key = completed_str
                     self.mode = ParserMode.EXPECT_COLON
                 elif mode == ParserMode.EXPECT_VALUE:
-                    if curr_key == "name":
+                    if curr_key == "name" and len(self.stack) == 1:
                         self.fn_name = completed_str.strip()
                     self.mode = ParserMode.AFTER_VALUE
             return True
 
         if self.in_string:
             self.buffer.append(char)
-            if mode == ParserMode.EXPECT_KEY and len(self.stack) == 1:
-                if len(self.buffer) <= 10:
+            if mode in (ParserMode.EXPECT_KEY, ParserMode.AFTER_COMMA) and len(self.stack) == 1:
+                if len(self.buffer) <= 15:
                     b_str = "".join(self.buffer)
                     if not ("name".startswith(b_str) or "parameters".startswith(b_str)):
                         self.is_invalid = True
                         return False
             if mode == ParserMode.EXPECT_VALUE:
                 self.current_val_buffer.append(char)
-                if curr_key == "name":
+                if curr_key == "name" and len(self.stack) == 1:
                     if not fn_trie.has_prefix(self.current_val_buffer):
                         self.is_invalid = True
                         return False
             return True
 
         if char == "{":
+            if self.stack and self.mode != ParserMode.EXPECT_VALUE:
+                self.is_invalid = True
+                return False
             self.stack.append("{")
             if curr_key == "parameters":
                 self.parameters_depth = len(self.stack)
             self.mode = ParserMode.EXPECT_KEY
             return True
         elif char == "[":
+            if self.mode != ParserMode.EXPECT_VALUE:
+                self.is_invalid = True
+                return False
             self.stack.append("[")
             self.mode = ParserMode.EXPECT_VALUE
             return True
+            
         elif char in "}]":
             if not self.stack:
                 self.is_invalid = True
@@ -208,7 +215,7 @@ class IncrementalPDAState:
                             elif c.isdigit():
                                 if dot_seen:
                                     decimals += 1
-                                    if decimals > 1:
+                                    if decimals > 4:
                                         self.is_invalid = True
                                         return False
                             else:
@@ -220,7 +227,10 @@ class IncrementalPDAState:
                         if b_str and not ("true".startswith(b_str) or "false".startswith(b_str)):
                             self.is_invalid = True
                             return False
-        return True
+            return True
+
+        self.is_invalid = True
+        return False
 
     def feed_str(self, token_str: str, functions: Dict[str, FunctionDefinition], fn_trie: FnNameTrie) -> bool:
         for char in token_str:
@@ -235,7 +245,7 @@ class JSONConstraintDecoder:
         vocab: Dict[str, int],
         functions_def: List[FunctionDefinition],
         tokenizer: ByteLevelBPETokenizer,
-        top_k: int = 10,
+        top_k: int = 5,
     ) -> None:
         self.vocab = vocab
         self.tokenizer = tokenizer
@@ -261,12 +271,10 @@ class JSONConstraintDecoder:
             raise RuntimeError(f"Parser became invalid after token {new_token_str!r}")
 
     def mask_logits(self, logits: List[float]) -> List[float]:
-        # 🚀 Օգտագործում ենք np.asarray և np.full_like՝ հիշողության զրոյական օվերհեդի համար
         logits_arr = np.asarray(logits, dtype=np.float32)
         masked_logits = np.full_like(logits_arr, -np.inf)
         
-        # 🚀 k=32 ավելի օպտիմալ արագության համար
-        k = min(32, len(logits_arr))
+        k = min(self.top_k, len(logits_arr))
         top_k_idx = np.argpartition(logits_arr, -k)[-k:]
         sorted_indices = top_k_idx[np.argsort(logits_arr[top_k_idx])[::-1]]
         
